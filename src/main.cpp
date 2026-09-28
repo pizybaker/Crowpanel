@@ -168,7 +168,7 @@ void fitText(const EpdFontData* f, char* out, size_t cap, const char* in, int ma
 }
 
 // Every screen change is the same full refresh: reset + init before each one,
-// exactly like the vendor examples and Ssd1683LegacyDriver.
+// exactly like the vendor examples (see docs/screen-bringup.md).
 void present() {
   uint32_t t0 = millis();
   EPD_RESET();

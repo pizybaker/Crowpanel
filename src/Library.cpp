@@ -112,7 +112,7 @@ int libraryScan(BookEntry* out, int max, bool sdOk) {
   }
   BookEntry& b = out[count++];
   b.path[0] = '\0';
-  snprintf(b.title, sizeof(b.title), "The Gray Man (built-in)");
+  snprintf(b.title, sizeof(b.title), "Getting started (built-in)");
   b.size = builtinBookLen();
   b.builtIn = true;
   b.epub = false;

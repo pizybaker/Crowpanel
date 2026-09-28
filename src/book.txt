@@ -1,0 +1,25 @@
+GETTING STARTED
+
+Welcome to your CrowPanel Reader. This short guide lives inside the firmware, so there is always something to read, even without an SD card.
+
+Rotate the dial down to turn the page, and up to go back. Every page turn is a full refresh, so the text stays crisp.
+
+THE CONTROLS
+
+The dial turns pages. Pressing the dial opens the contents of the book you are reading: rotate to pick a chapter, press to jump to it, or press EXIT to return to your page.
+
+MENU takes you to the library. EXIT takes you to the home screen. Your place in every book is saved automatically.
+
+ADDING BOOKS
+
+Copy .epub or .txt files to the SD card, either in the root folder or in a folder called books. Press MENU on the library screen to look for new files.
+
+You can also add books without removing the card. Choose "Add books over Wi-Fi" at the top of the library. Scan the first QR code with your phone to join the reader's Wi-Fi network, then scan the second to open the upload page. Pick your books, upload them, and press EXIT on the reader when you are done.
+
+THE HOME SCREEN
+
+Put a JPEG named bg.jpg in the root of the SD card and it becomes your home screen. Any size works: the picture is scaled to fill the screen and dithered for the e-paper panel.
+
+HAPPY READING
+
+That is everything. Press MENU to open the library and pick your first book.

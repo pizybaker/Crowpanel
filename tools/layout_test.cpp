@@ -1,8 +1,8 @@
 // Host check of TextLayout.h: across a whole book every visible byte is drawn
 // exactly once, in order, and nothing is drawn outside the text column.
-// Build/run (from repo root), with an extracted EPUB text or a .txt:
-//   c++ -std=c++17 -Ifirmware_reader/src -Ilib/EpdFont firmware_reader/tools/layout_test.cpp \
-//       firmware_reader/src/Font.cpp -o /tmp/layout_test && /tmp/layout_test book.txt
+// Build/run (from repo root), with a .txt book or extracted EPUB text:
+//   c++ -std=c++17 -Isrc -Iinclude tools/layout_test.cpp src/Font.cpp -o /tmp/layout_test
+//   /tmp/layout_test src/book.txt
 #include <cstdio>
 #include <fstream>
 #include <sstream>
