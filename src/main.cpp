@@ -1,6 +1,7 @@
 // Book reader firmware for the Elecrow CrowPanel 4.2" (green-sticker V1.2A).
 //
-// Boot -> Home screen: /bg.jpg from the SD card root. MENU opens the library.
+// Boot -> Home screen: the chosen wallpaper (see Wallpaper.h), else /bg.jpg.
+// MENU opens the library.
 // Library: pick a .epub or .txt book from the SD card (or the built-in one),
 // or the top row "Add books over Wi-Fi" to upload books from a phone.
 // The selected row is inverted and a 5-key bar at the bottom highlights the
@@ -20,6 +21,7 @@
 #include "HomeImage.h"
 #include "Library.h"
 #include "Transfer.h"
+#include "Wallpaper.h"
 #include "BigAlloc.h"
 #include "fonts/sans11_bold.h"
 #include "fonts/sans7_bold.h"
@@ -82,7 +84,6 @@ const font::Canvas canvas{imageBuf, EPD_W, EPD_H};
 
 enum class Screen { Home, Library, Reader, Toc, Transfer };
 
-constexpr const char* HOME_IMAGE_PATH = "/bg.jpg";
 constexpr size_t MAX_HOME_IMAGE_BYTES = 4 * 1024 * 1024;
 
 struct Progress {
@@ -109,7 +110,8 @@ transfer::Info wifi;
 
 // Decoded home image, kept so returning home doesn't re-decode the JPEG.
 uint8_t homeFrame[(EPD_W * EPD_H) / 8];
-uint32_t homeImageSize = 0;  // size of the bg.jpg homeFrame came from; 0 = none
+char homeImagePath[160] = "";  // file homeFrame was decoded from ("" = none)
+uint32_t homeImageSize = 0;
 const char* homeError = "";
 int lastButton = -1;
 char status[96] = "";
@@ -362,19 +364,21 @@ void renderMessage(const char* heading, const char* detail) {
   present();
 }
 
-// Re-decodes only when bg.jpg appeared or changed size since the last decode.
+// Re-decodes only when the wallpaper file changed since the last decode.
 bool loadHomeImage() {
-  File f = sdOk ? SD.open(HOME_IMAGE_PATH, FILE_READ) : File();
+  char path[160];
+  wallpaper::current(path, sizeof(path));
+  File f = sdOk ? SD.open(path, FILE_READ) : File();
   if (!f) {
-    homeImageSize = 0;
-    homeError = sdOk ? "no /bg.jpg on the SD card" : "no SD card";
+    homeImagePath[0] = '\0';
+    homeError = sdOk ? "add one over Wi-Fi, or put bg.jpg on the SD card" : "no SD card";
     return false;
   }
   const size_t size = f.size();
-  if (size == homeImageSize) return true;
-  homeImageSize = 0;
+  if (size == homeImageSize && strcmp(path, homeImagePath) == 0) return true;
+  homeImagePath[0] = '\0';
   if (size == 0 || size > MAX_HOME_IMAGE_BYTES) {
-    homeError = "bg.jpg is empty or larger than 4 MB";
+    homeError = "the image is empty or larger than 4 MB";
     return false;
   }
   auto* jpg = static_cast<uint8_t*>(bigAlloc(size));
@@ -385,8 +389,11 @@ bool loadHomeImage() {
   const uint32_t t0 = millis();
   bool ok = f.read(jpg, size) == size && decodeJpegToFrame(jpg, size, homeFrame, EPD_W, EPD_H, &homeError);
   bigFree(jpg);
-  if (ok) homeImageSize = size;
-  Serial.printf("[home] %s %u bytes in %lu ms%s%s\n", ok ? "decoded" : "failed", static_cast<unsigned>(size),
+  if (ok) {
+    snprintf(homeImagePath, sizeof(homeImagePath), "%s", path);
+    homeImageSize = size;
+  }
+  Serial.printf("[home] %s %s, %u bytes in %lu ms%s%s\n", ok ? "decoded" : "failed", path, static_cast<unsigned>(size),
                 millis() - t0, ok ? "" : ": ", ok ? "" : homeError);
   return ok;
 }
@@ -400,7 +407,7 @@ void renderHome() {
   drawCentered(UI_TITLE, 0, SCREEN_W, 120, "CrowPanel Reader");
   drawCentered(BODY, 0, SCREEN_W, 160, "Press MENU for the library");
   char msg[112], line[112];
-  snprintf(msg, sizeof(msg), "Home image: %s", homeError);
+  snprintf(msg, sizeof(msg), "Wallpaper: %s", homeError);
   fitText(UI, line, sizeof(line), msg, SCREEN_W - 2 * MARGIN_X);
   drawCentered(UI, 0, SCREEN_W, 280, line);
 }
@@ -463,6 +470,7 @@ void stopTransfer() {
   transfer::stop();
   const int added = transfer::receivedCount();
   if (transfer::libraryChanged()) rescan();
+  if (transfer::wallpaperChanged()) homeImagePath[0] = '\0';  // re-decode on next home visit
   if (added) snprintf(status, sizeof(status), "Added %d book%s over Wi-Fi", added, added == 1 ? "" : "s");
   else snprintf(status, sizeof(status), "Wi-Fi off");
   screen = Screen::Library;

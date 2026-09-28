@@ -2,8 +2,9 @@
 
 #include <cstdint>
 
-// Wi-Fi book transfer: the reader runs its own WPA2 hotspot and a small web
-// server; a phone joins it and uploads .epub/.txt files into /books.
+// Wi-Fi transfer: the reader runs its own WPA2 hotspot and a small web server;
+// a phone joins it to upload books into /books and wallpapers into /wallpapers
+// and to choose the home-screen wallpaper.
 namespace transfer {
 
 struct Info {
@@ -28,5 +29,6 @@ bool takeSettledChange();
 int receivedCount();
 const char* lastMessage();  // e.g. "Received “Dune” (1.2 MB)"
 bool libraryChanged();      // anything added or deleted since start()
+bool wallpaperChanged();    // wallpaper added, deleted or chosen since start()
 
 }  // namespace transfer
