@@ -13,7 +13,8 @@ namespace {
 constexpr size_t MAX_TXT_BYTES = 6 * 1024 * 1024;  // leaves ~2 MB of the 8 MB PSRAM
 constexpr size_t READ_CHUNK = 16 * 1024;
 constexpr const char* CACHE_DIR = "/.reader";
-constexpr uint32_t CACHE_VERSION = 1;  // bump when HtmlToText output changes
+constexpr uint32_t CACHE_VERSION = 2;  // bump when HtmlToText output or the .toc format changes
+constexpr uint32_t TOC_MAGIC = 0x31434F54;  // "TOC1"
 
 bool readAll(File& f, char* dst, size_t n) {
   size_t got = 0;
@@ -30,12 +31,31 @@ bool sdReadAt(void* ctx, uint32_t offset, void* dst, size_t n) {
   return f.seek(offset) && readAll(f, static_cast<char*>(dst), n);
 }
 
-void cachePath(const BookEntry& e, char* out, size_t cap) {
+// ext is "txt" (extracted text) or "toc" (TocEntry array).
+void cachePath(const BookEntry& e, const char* ext, char* out, size_t cap) {
   uint32_t h = 2166136261u;
   for (const char* p = e.path; *p; p++) h = (h ^ static_cast<uint8_t>(*p)) * 16777619u;
   h ^= e.size;
-  snprintf(out, cap, "%s/%08lx_v%lu.txt", CACHE_DIR, static_cast<unsigned long>(h),
-           static_cast<unsigned long>(CACHE_VERSION));
+  snprintf(out, cap, "%s/%08lx_v%lu.%s", CACHE_DIR, static_cast<unsigned long>(h),
+           static_cast<unsigned long>(CACHE_VERSION), ext);
+}
+
+bool readToc(const char* path, std::vector<TocEntry>& toc) {
+  File f = SD.open(path, FILE_READ);
+  uint32_t hdr[2];
+  if (!f || f.read(reinterpret_cast<uint8_t*>(hdr), sizeof(hdr)) != sizeof(hdr) || hdr[0] != TOC_MAGIC ||
+      hdr[1] > MAX_TOC_ENTRIES)
+    return false;
+  toc.resize(hdr[1]);
+  return hdr[1] == 0 || readAll(f, reinterpret_cast<char*>(toc.data()), sizeof(TocEntry) * hdr[1]);
+}
+
+void writeToc(const char* path, const TocEntry* entries, size_t count) {
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return;
+  const uint32_t hdr[2] = {TOC_MAGIC, static_cast<uint32_t>(count)};
+  f.write(reinterpret_cast<const uint8_t*>(hdr), sizeof(hdr));
+  f.write(reinterpret_cast<const uint8_t*>(entries), sizeof(TocEntry) * count);
 }
 
 }  // namespace
@@ -43,7 +63,7 @@ void cachePath(const BookEntry& e, char* out, size_t cap) {
 bool bookNeedsExtraction(const BookEntry& entry) {
   if (!entry.epub) return false;
   char path[64];
-  cachePath(entry, path, sizeof(path));
+  cachePath(entry, "txt", path, sizeof(path));
   return !SD.exists(path);
 }
 
@@ -65,13 +85,14 @@ bool Book::loadTxt(const BookEntry& e) {
 }
 
 bool Book::loadEpub(const BookEntry& e) {
-  char cache[64];
-  cachePath(e, cache, sizeof(cache));
+  char cache[64], tocCache[64];
+  cachePath(e, "txt", cache, sizeof(cache));
+  cachePath(e, "toc", tocCache, sizeof(tocCache));
   if (File c = SD.open(cache, FILE_READ)) {
     len = c.size();
     buf = static_cast<char*>(bigAlloc(len + 1));
-    if (buf && readAll(c, buf, len)) {
-      Serial.printf("[book] cache hit %s\n", cache);
+    if (buf && readAll(c, buf, len) && readToc(tocCache, toc)) {
+      Serial.printf("[book] cache hit %s (%u chapters)\n", cache, static_cast<unsigned>(toc.size()));
       return true;
     }
     bigFree(buf);
@@ -86,6 +107,8 @@ bool Book::loadEpub(const BookEntry& e) {
   if (!epubExtract(src, out, &err)) return false;
   buf = out.text;
   len = out.len;
+  toc.assign(out.toc, out.toc + out.tocCount);
+  bigFree(out.toc);
 
   SD.mkdir(CACHE_DIR);
   if (File c = SD.open(cache, FILE_WRITE)) {
@@ -93,6 +116,7 @@ bool Book::loadEpub(const BookEntry& e) {
     c.close();  // must close before a possible remove
     if (!ok) SD.remove(cache);
     Serial.printf("[book] cache %s %s\n", ok ? "written" : "write failed", cache);
+    if (ok) writeToc(tocCache, toc.data(), toc.size());
   }
   return true;
 }
@@ -121,6 +145,7 @@ bool Book::open(const BookEntry& e, const text::Fonts& f, const text::Geometry& 
     return false;
   }
   buf[len] = '\0';
+  finishToc(!e.epub);
   const uint32_t t1 = millis();
   paginate();
   Serial.printf("[book] '%s': %u bytes, load %lu ms, %d pages in %lu ms\n", e.title, static_cast<unsigned>(len),
@@ -128,7 +153,33 @@ bool Book::open(const BookEntry& e, const text::Fonts& f, const text::Geometry& 
   return true;
 }
 
+void Book::finishToc(bool plainText) {
+  if (toc.empty()) {
+    toc.resize(MAX_TOC_ENTRIES);
+    toc.resize(toc::fromText(buf, len, toc.data(), toc.size(), plainText));
+  }
+  // Point each entry at its first visible character (see toc::toVisible).
+  size_t kept = 0;
+  for (TocEntry& t : toc) {
+    t.offset = toc::toVisible(buf, len, t.offset);
+    if (t.offset < len) toc[kept++] = t;
+  }
+  toc.resize(kept);
+  toc.shrink_to_fit();
+}
+
+int Book::chapterForPage(int page) const {
+  int found = -1;
+  for (size_t i = 0; i < toc.size(); i++) {
+    if (pageForOffset(toc[i].offset) > page) break;
+    found = static_cast<int>(i);
+  }
+  return found;
+}
+
 void Book::close() {
+  toc.clear();
+  toc.shrink_to_fit();
   bigFree(buf);
   buf = nullptr;
   len = 0;

@@ -46,6 +46,27 @@ constexpr Entity ENTITIES[] = {
 
 bool isSpace(char c) { return static_cast<unsigned char>(c) <= ' '; }
 
+// Value of attribute `name` within [p, end) (the attribute part of a tag).
+bool attrValue(const char* p, const char* end, const char* name, const char*& v, size_t& n) {
+  const size_t nl = strlen(name);
+  for (const char* q = p; q + nl < end; q++) {
+    if (!isSpace(q[0]) || memcmp(q + 1, name, nl) != 0) continue;
+    const char* e = q + 1 + nl;
+    while (e < end && isSpace(*e)) e++;
+    if (e >= end || *e != '=') continue;
+    e++;
+    while (e < end && isSpace(*e)) e++;
+    if (e >= end || (*e != '"' && *e != '\'')) continue;
+    const char quote = *e++;
+    const char* close = static_cast<const char*>(memchr(e, quote, end - e));
+    if (!close) return false;
+    v = e;
+    n = close - e;
+    return true;
+  }
+  return false;
+}
+
 Kind lookupTag(const char* name, size_t n) {
   for (const auto& t : TAGS) {
     if (strlen(t.name) == n && strncmp(t.name, name, n) == 0) return t.kind;
@@ -184,6 +205,26 @@ const char* HtmlToText::tag(const char* p, const char* end) {
     }
   }
 
+  // Anchor targets (id="..." or <a name="...">) resolve to the position after
+  // this tag's own effect, i.e. where its content starts.
+  const Anchor* hit = nullptr;
+  if (anchorCount && !closing) {
+    const char* v;
+    size_t vn;
+    if (attrValue(nameEnd, q, "id", v, vn) || attrValue(nameEnd, q, "name", v, vn)) {
+      for (size_t i = 0; i < anchorCount && !hit; i++) {
+        if (anchors[i].idLen == vn && memcmp(anchors[i].id, v, vn) == 0) hit = &anchors[i];
+      }
+    }
+  }
+  struct RecordOnExit {
+    const Anchor* a;
+    const size_t& pos;
+    ~RecordOnExit() {
+      if (a && *a->offset == UINT32_MAX) *a->offset = static_cast<uint32_t>(pos);
+    }
+  } record{hit, pos};
+
   const Kind kind = n ? lookupTag(lower, n) : Kind::Other;
   if (kind == Kind::Skip) {
     if (closing) {
@@ -226,11 +267,14 @@ const char* HtmlToText::tag(const char* p, const char* end) {
   return q;
 }
 
-void HtmlToText::addChapter(const char* html, size_t len) {
+uint32_t HtmlToText::addChapter(const char* html, size_t len, const Anchor* chapterAnchors, size_t count) {
   if (pos > 0) {
     paragraphBreak();
     put(markup::PAGE_BREAK);
   }
+  const auto start = static_cast<uint32_t>(pos);
+  anchors = chapterAnchors;
+  anchorCount = count;
   atParaStart = true;
   pendingSpace = false;
   boldDepth = italicDepth = skipDepth = 0;
@@ -265,4 +309,7 @@ void HtmlToText::addChapter(const char* html, size_t len) {
     }
   }
   paragraphBreak();
+  anchors = nullptr;
+  anchorCount = 0;
+  return start;
 }

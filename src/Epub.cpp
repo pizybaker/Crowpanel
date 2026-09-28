@@ -4,11 +4,14 @@
 
 #include <strings.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #include "BigAlloc.h"
 #include "HtmlText.h"
+#include "Toc.h"
 
 namespace {
 
@@ -256,6 +259,129 @@ char* loadOpf(const Zip& zip, size_t& opfLen, char* opfPath, size_t pathCap, Spa
   return o ? zip.read(*o, opfLen) : nullptr;
 }
 
+// Like forEachTag but also reports end tags: fn(localName, n, closing, lt, gt).
+template <typename Fn>
+void forEachTagAll(const char* p, const char* end, Fn fn) {
+  while (p < end) {
+    const char* lt = static_cast<const char*>(memchr(p, '<', end - p));
+    if (!lt || lt + 1 >= end) return;
+    const char* gt = static_cast<const char*>(memchr(lt, '>', end - lt));
+    if (!gt) return;
+    const char* name = lt + 1;
+    const bool closing = *name == '/';
+    if (closing) name++;
+    if (*name != '!' && *name != '?') {
+      const char* ne = name;
+      while (ne < gt && *ne != ' ' && *ne != '\t' && *ne != '\n' && *ne != '\r' && *ne != '/') ne++;
+      for (const char* c = name; c < ne; c++) {
+        if (*c == ':') name = c + 1;
+      }
+      if (!fn(name, static_cast<size_t>(ne - name), closing, lt, gt)) return;
+    }
+    p = gt + 1;
+  }
+}
+
+struct RawToc {
+  const Entry* doc;  // spine document the entry points into
+  char frag[64];     // "#fragment" target, empty for the document start
+  uint8_t depth;
+  char title[sizeof(TocEntry::title)];
+  uint32_t offset;
+};
+
+// Label markup (entities, nested spans) -> plain title, via the chapter converter.
+void labelToTitle(const char* s, const char* e, char* title, size_t cap) {
+  char buf[256];
+  const size_t n = static_cast<size_t>(e - s) < sizeof(buf) - 16 ? e - s : sizeof(buf) - 16;
+  HtmlToText conv(buf, sizeof(buf) - 1);
+  conv.addChapter(s, n);
+  toc::copyTitle(title, cap, buf, conv.length());
+}
+
+void addRaw(const Zip& zip, const Span& dir, const Span& href, int depth, const char* title, RawToc* out,
+            size_t& count) {
+  if (count >= MAX_TOC_ENTRIES || !href.n || !title[0]) return;
+  char path[320];
+  const size_t pl = resolveHref(dir, href, path, sizeof(path));
+  RawToc& r = out[count];
+  r.doc = zip.find(path, pl);
+  if (!r.doc) return;
+  r.frag[0] = '\0';
+  if (const char* hash = static_cast<const char*>(memchr(href.p, '#', href.n))) {
+    const size_t fl = href.p + href.n - hash - 1;
+    if (fl < sizeof(r.frag)) {
+      memcpy(r.frag, hash + 1, fl);
+      r.frag[fl] = '\0';
+    }
+  }
+  r.depth = static_cast<uint8_t>(depth < 0 ? 0 : depth > 6 ? 6 : depth);
+  snprintf(r.title, sizeof(r.title), "%s", title);
+  r.offset = UINT32_MAX;
+  count++;
+}
+
+// EPUB 2: <navPoint><navLabel><text>..</text></navLabel><content src=".."/>..</navPoint>
+void parseNcx(const Zip& zip, const Span& dir, const char* doc, size_t len, RawToc* out, size_t& count) {
+  int depth = -1;
+  char label[sizeof(RawToc::title)] = "";
+  forEachTagAll(doc, doc + len, [&](const char* name, size_t n, bool closing, const char* lt, const char* gt) {
+    if (nameIs(name, n, "navPoint")) {
+      depth += closing ? -1 : 1;
+      if (!closing) label[0] = '\0';
+    } else if (!closing && nameIs(name, n, "text") && depth >= 0) {
+      const char* e = static_cast<const char*>(memchr(gt, '<', doc + len - gt));
+      if (e) labelToTitle(gt + 1, e, label, sizeof(label));
+    } else if (!closing && nameIs(name, n, "content") && depth >= 0) {
+      addRaw(zip, dir, attr(lt, gt, "src"), depth, label, out, count);
+    }
+    return true;
+  });
+}
+
+// EPUB 3: <nav epub:type="toc"><ol><li><a href="..">Title</a><ol>..</ol></li></ol></nav>
+void parseNav(const Zip& zip, const Span& dir, const char* doc, size_t len, RawToc* out, size_t& count) {
+  const char* end = doc + len;
+  const char* navStart = nullptr;
+  const char* firstNav = nullptr;
+  forEachTag(doc, end, [&](const char* name, size_t n, const char* lt, const char* gt) {
+    if (!nameIs(name, n, "nav")) return true;
+    if (!firstNav) firstNav = gt + 1;
+    Span type = attr(lt, gt, "epub:type");
+    for (size_t i = 0; i + 3 <= type.n; i++) {
+      if (memcmp(type.p + i, "toc", 3) == 0) {
+        navStart = gt + 1;
+        return false;
+      }
+    }
+    return true;
+  });
+  if (!navStart) navStart = firstNav;
+  if (!navStart) return;
+
+  int level = 0;
+  const char* aHref = nullptr;
+  Span href;
+  const char* aText = nullptr;
+  forEachTagAll(navStart, end, [&](const char* name, size_t n, bool closing, const char* lt, const char* gt) {
+    if (nameIs(name, n, "nav") && closing) return false;
+    if (nameIs(name, n, "ol")) level += closing ? -1 : 1;
+    if (nameIs(name, n, "a")) {
+      if (!closing) {
+        href = attr(lt, gt, "href");
+        aHref = href.p;
+        aText = gt + 1;
+      } else if (aHref && aText) {
+        char title[sizeof(RawToc::title)];
+        labelToTitle(aText, lt, title, sizeof(title));
+        addRaw(zip, dir, href, level - 1, title, out, count);
+        aHref = aText = nullptr;
+      }
+    }
+    return true;
+  });
+}
+
 }  // namespace
 
 bool epubTitle(const ByteSource& src, char* title, size_t cap) {
@@ -283,7 +409,7 @@ bool epubExtract(const ByteSource& src, EpubText& out, const char** err) {
 
   // Spine order -> zip entries. Two passes: size the output, then convert.
   struct Item {
-    Span id, href;
+    Span id, href, mediaType, properties;
   };
   size_t itemCap = 64, itemCount = 0;
   auto* items = static_cast<Item*>(bigAlloc(sizeof(Item) * itemCap));
@@ -295,12 +421,44 @@ bool epubExtract(const ByteSource& src, EpubText& out, const char** err) {
       items = static_cast<Item*>(bigRealloc(items, sizeof(Item) * itemCap));
       if (!items) return false;
     }
-    items[itemCount++] = {attr(lt, gt, "id"), attr(lt, gt, "href")};
+    items[itemCount++] = {attr(lt, gt, "id"), attr(lt, gt, "href"), attr(lt, gt, "media-type"),
+                          attr(lt, gt, "properties")};
     return true;
   });
   if (!items) {
     bigFree(opf);
     return *err = "out of memory", false;
+  }
+
+  // Table of contents: EPUB 3 nav document, else the EPUB 2 NCX.
+  size_t rawCount = 0;
+  auto* raw = static_cast<RawToc*>(bigAlloc(sizeof(RawToc) * MAX_TOC_ENTRIES));
+  if (raw) {
+    const Item* nav = nullptr;
+    const Item* ncx = nullptr;
+    for (size_t i = 0; i < itemCount; i++) {
+      const Span& pr = items[i].properties;
+      for (size_t k = 0; k + 3 <= pr.n && !nav; k++) {
+        if (memcmp(pr.p + k, "nav", 3) == 0 && (k == 0 || pr.p[k - 1] == ' ') && (k + 3 == pr.n || pr.p[k + 3] == ' '))
+          nav = &items[i];
+      }
+      const Span& mt = items[i].mediaType;
+      if (!ncx && mt.n == 24 && memcmp(mt.p, "application/x-dtbncx+xml", 24) == 0) ncx = &items[i];
+    }
+    for (const Item* doc : {nav, ncx}) {
+      if (!doc || rawCount) continue;
+      char path[320];
+      const size_t pl = resolveHref(dir, doc->href, path, sizeof(path));
+      const Entry* e = zip.find(path, pl);
+      size_t len = 0;
+      char* body = e ? zip.read(*e, len) : nullptr;
+      if (!body) continue;
+      const char* slash = strrchr(path, '/');
+      const Span docDir{path, slash ? static_cast<size_t>(slash - path) : 0};
+      if (doc == nav) parseNav(zip, docDir, body, len, raw, rawCount);
+      else parseNcx(zip, docDir, body, len, raw, rawCount);
+      bigFree(body);
+    }
   }
 
   auto spineEntry = [&](const char* lt, const char* gt) -> const Entry* {
@@ -328,6 +486,7 @@ bool epubExtract(const ByteSource& src, EpubText& out, const char** err) {
     return true;
   });
   if (chapters == 0) {
+    bigFree(raw);
     bigFree(items);
     bigFree(opf);
     return *err = "EPUB has no readable chapters", false;
@@ -336,6 +495,7 @@ bool epubExtract(const ByteSource& src, EpubText& out, const char** err) {
 
   out.text = static_cast<char*>(bigAlloc(capacity + 1));
   if (!out.text) {
+    bigFree(raw);
     bigFree(items);
     bigFree(opf);
     return *err = "out of memory", false;
@@ -352,18 +512,42 @@ bool epubExtract(const ByteSource& src, EpubText& out, const char** err) {
       readFailed = true;
       return true;  // skip a bad chapter rather than lose the book
     }
-    conv.addChapter(html, len);
+    HtmlToText::Anchor anchors[32];
+    size_t anchorCount = 0;
+    for (size_t i = 0; i < rawCount && anchorCount < 32; i++) {
+      if (raw[i].doc == e && raw[i].frag[0]) anchors[anchorCount++] = {raw[i].frag, strlen(raw[i].frag), &raw[i].offset};
+    }
+    const uint32_t start = conv.addChapter(html, len, anchors, anchorCount);
+    for (size_t i = 0; i < rawCount; i++) {
+      if (raw[i].doc == e && raw[i].offset == UINT32_MAX) raw[i].offset = start;  // no fragment, or not found
+    }
     bigFree(html);
     return true;
   });
   bigFree(items);
   bigFree(opf);
 
+  // Keep entries that landed in the spine, in reading order.
+  if (raw && rawCount) {
+    out.toc = static_cast<TocEntry*>(bigAlloc(sizeof(TocEntry) * rawCount));
+    for (size_t i = 0; out.toc && i < rawCount; i++) {
+      if (raw[i].offset == UINT32_MAX) continue;
+      TocEntry& t = out.toc[out.tocCount++];
+      t.offset = raw[i].offset;
+      t.depth = raw[i].depth;
+      memcpy(t.title, raw[i].title, sizeof(t.title));
+    }
+  }
+  bigFree(raw);
+
   out.len = conv.length();
   out.text[out.len] = '\0';
   if (out.len == 0) {
     bigFree(out.text);
+    bigFree(out.toc);
     out.text = nullptr;
+    out.toc = nullptr;
+    out.tocCount = 0;
     return *err = readFailed ? "could not decompress chapters" : "EPUB contains no text", false;
   }
   return true;

@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "Toc.h"
+
 // Random-access byte source (SD file on device, FILE* on host).
 struct ByteSource {
   void* ctx;
@@ -14,6 +16,8 @@ struct EpubText {
   char* text = nullptr;  // bigAlloc'd, owned by caller (bigFree)
   size_t len = 0;
   char title[96] = "";
+  TocEntry* toc = nullptr;  // bigAlloc'd, owned by caller; entries in reading order
+  size_t tocCount = 0;
 };
 
 // Extracts every spine chapter as book text (see Markup.h). On failure returns

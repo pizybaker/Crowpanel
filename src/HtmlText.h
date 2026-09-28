@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 // Converts EPUB XHTML chapters into book text (UTF-8 + markup.h markers),
 // appending to a caller-owned buffer. Output for a document is never longer
@@ -8,10 +9,19 @@
 // anything beyond capacity is dropped rather than overflowing.
 class HtmlToText {
  public:
+  // An element id to locate within the next chapter; *offset is set to the
+  // text position of the first element carrying it (left untouched if absent).
+  struct Anchor {
+    const char* id;
+    size_t idLen;
+    uint32_t* offset;
+  };
+
   HtmlToText(char* out, size_t capacity) : out(out), cap(capacity) {}
 
-  // Appends one XHTML document; every document after the first starts on a new page.
-  void addChapter(const char* html, size_t len);
+  // Appends one XHTML document; every document after the first starts on a new
+  // page. Returns the text offset where this document starts.
+  uint32_t addChapter(const char* html, size_t len, const Anchor* anchors = nullptr, size_t anchorCount = 0);
   size_t length() const { return pos; }
 
  private:
@@ -33,4 +43,6 @@ class HtmlToText {
   bool curBold = false, curItalic = false;
   int boldDepth = 0, italicDepth = 0, skipDepth = 0;
   bool inHeading = false;
+  const Anchor* anchors = nullptr;
+  size_t anchorCount = 0;
 };

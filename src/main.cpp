@@ -4,8 +4,9 @@
 // Library: pick a .epub or .txt book from the SD card (or the built-in one).
 // The selected row is inverted and a 5-key bar at the bottom highlights the
 // last button pressed, with a status line saying what it did. EXIT goes home.
-// Reader: rotary DOWN / press = next page, rotary UP = previous page,
-// MENU = library, EXIT = home. Every page turn is a full refresh.
+// Reader: rotary DOWN = next page, rotary UP = previous page, rotary press =
+// contents (jump to a chapter), MENU = library, EXIT = home. Every page turn
+// is a full refresh.
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -67,11 +68,13 @@ constexpr int VISIBLE_ROWS = (STATUS_RULE_Y - LIST_TOP) / ROW_H;
 
 // Bar order matches Button enum order.
 constexpr const char* LIBRARY_KEY_ACTIONS[BUTTON_COUNT] = {"Rescan", "Prev", "Open", "Next", "Home"};
+constexpr const char* TOC_KEY_ACTIONS[BUTTON_COUNT] = {"Library", "Prev", "Go", "Next", "Back"};
+constexpr int TOC_INDENT = 14;
 
 uint8_t imageBuf[(EPD_W * EPD_H) / 8];
 const font::Canvas canvas{imageBuf, EPD_W, EPD_H};
 
-enum class Screen { Home, Library, Reader };
+enum class Screen { Home, Library, Reader, Toc };
 
 constexpr const char* HOME_IMAGE_PATH = "/bg.jpg";
 constexpr size_t MAX_HOME_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -91,6 +94,9 @@ bool sdOk = false;
 Book book;
 int openBook = -1;
 int page = 0;
+int tocSelected = 0;
+int tocTop = 0;
+int tocCurrent = -1;  // chapter containing the page the contents were opened from
 
 Screen screen = Screen::Home;
 
@@ -192,40 +198,34 @@ void saveProgress() {
 
 // ---------------------------------------------------------------- screens
 
-void renderLibrary() {
+// Title bar, scrolling rows, status line and 5-key bar shared by the library
+// and contents screens. drawRow(index, y, selected) draws one row's content.
+template <typename RowFn>
+void drawListScreen(const char* title, int sel, int count, int top, const char* statusText,
+                    const char* const* actions, RowFn drawRow) {
   clear();
-
   fillRect(0, 0, SCREEN_W, TITLE_BAR_H, true);
-  drawText(UI_TITLE, MARGIN_X, 23, "Library", true);
-  char buf[112];
-  snprintf(buf, sizeof(buf), "%d / %d", selected + 1, bookCount);
+  drawText(UI_TITLE, MARGIN_X, 23, title, true);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d / %d", sel + 1, count);
   drawRight(UI, SCREEN_W - MARGIN_X, 20, buf, true);
 
-  for (int r = 0; r < VISIBLE_ROWS; r++) {
-    const int i = scrollTop + r;
-    if (i >= bookCount) break;
+  for (int r = 0; r < VISIBLE_ROWS && top + r < count; r++) {
     const int y = LIST_TOP + r * ROW_H;
-    const bool sel = i == selected;
-    if (sel) fillRect(0, y, SCREEN_W, y + ROW_H - 2, true);
-
-    char right[16] = "";
-    Progress p;
-    if (loadProgress(books[i], p)) snprintf(right, sizeof(right), "%u%%", p.percent);
-    else if (books[i].epub) snprintf(right, sizeof(right), "EPUB");
-    const int rightW = right[0] ? textWidth(UI, right) + 10 : 0;
-
-    char title[112];
-    fitText(BODY, title, sizeof(title), books[i].title, SCREEN_W - 2 * MARGIN_X - 14 - rightW);
-    if (sel) drawText(BODY, MARGIN_X, y + 18, "\xE2\x80\xBA", true);  // "›"
-    drawText(BODY, MARGIN_X + 14, y + 18, title, sel);
-    if (right[0]) drawRight(UI, SCREEN_W - MARGIN_X, y + 17, right, sel);
+    const bool isSel = top + r == sel;
+    if (isSel) fillRect(0, y, SCREEN_W, y + ROW_H - 2, true);
+    drawRow(top + r, y, isSel);
   }
-  if (scrollTop > 0) drawRight(UI, SCREEN_W - 2, LIST_TOP + 10, "\xE2\x86\x91");  // "↑"
-  if (scrollTop + VISIBLE_ROWS < bookCount) drawRight(UI, SCREEN_W - 2, STATUS_RULE_Y - 4, "\xE2\x86\x93");
+  if (count > VISIBLE_ROWS) {  // scrollbar thumb in the right margin
+    const int trackH = VISIBLE_ROWS * ROW_H - 2;
+    const int thumbH = trackH * VISIBLE_ROWS / count < 8 ? 8 : trackH * VISIBLE_ROWS / count;
+    const int thumbY = LIST_TOP + (trackH - thumbH) * top / (count - VISIBLE_ROWS);
+    fillRect(SCREEN_W - 4, thumbY, SCREEN_W - 1, thumbY + thumbH, true);
+  }
 
   hRule(STATUS_RULE_Y);
   char line[112];
-  fitText(UI, line, sizeof(line), status, SCREEN_W - 2 * MARGIN_X);
+  fitText(UI, line, sizeof(line), statusText, SCREEN_W - 2 * MARGIN_X);
   drawText(UI, MARGIN_X, STATUS_BASELINE, line);
 
   for (int k = 0; k < BUTTON_COUNT; k++) {
@@ -234,8 +234,40 @@ void renderLibrary() {
     if (hit) fillRect(x0, BAR_TOP, x0 + BAR_KEY_W, BAR_BOTTOM + 1, true);
     frame(x0, BAR_TOP, x0 + BAR_KEY_W, BAR_BOTTOM + 1);
     drawCentered(UI_BOLD, x0, BAR_KEY_W, BAR_TOP + 15, buttonName(static_cast<Button>(k)), hit);
-    drawCentered(UI, x0, BAR_KEY_W, BAR_TOP + 31, LIBRARY_KEY_ACTIONS[k], hit);
+    drawCentered(UI, x0, BAR_KEY_W, BAR_TOP + 31, actions[k], hit);
   }
+}
+
+// One list row: optional left marker, title (ellipsized), optional right label.
+void drawRow(int y, bool sel, int indent, const char* marker, const char* title, const char* right) {
+  const int rightW = right[0] ? textWidth(UI, right) + 10 : 0;
+  char fitted[112];
+  fitText(BODY, fitted, sizeof(fitted), title, SCREEN_W - 2 * MARGIN_X - 14 - indent - rightW);
+  if (marker[0]) drawText(BODY, MARGIN_X + indent, y + 18, marker, sel);
+  drawText(BODY, MARGIN_X + 14 + indent, y + 18, fitted, sel);
+  if (right[0]) drawRight(UI, SCREEN_W - MARGIN_X, y + 17, right, sel);
+}
+
+void renderLibrary() {
+  drawListScreen("Library", selected, bookCount, scrollTop, status, LIBRARY_KEY_ACTIONS, [](int i, int y, bool sel) {
+    char right[16] = "";
+    Progress p;
+    if (loadProgress(books[i], p)) snprintf(right, sizeof(right), "%u%%", p.percent);
+    else if (books[i].epub) snprintf(right, sizeof(right), "EPUB");
+    drawRow(y, sel, 0, sel ? "\xE2\x80\xBA" : "", books[i].title, right);  // "›"
+  });
+}
+
+void renderToc() {
+  const auto& ch = book.chapters();
+  drawListScreen("Contents", tocSelected, static_cast<int>(ch.size()), tocTop, status, TOC_KEY_ACTIONS,
+                 [&](int i, int y, bool sel) {
+                   char right[16];
+                   snprintf(right, sizeof(right), "%d", book.pageForOffset(ch[i].offset) + 1);
+                   // "›" on the selection, "•" on the chapter being read.
+                   const char* marker = sel ? "\xE2\x80\xBA" : i == tocCurrent ? "\xE2\x80\xA2" : "";
+                   drawRow(y, sel, ch[i].depth * TOC_INDENT, marker, ch[i].title, right);
+                 });
 }
 
 void renderReader() {
@@ -316,6 +348,7 @@ void renderHome() {
 void render() {
   if (screen == Screen::Home) renderHome();
   else if (screen == Screen::Library) renderLibrary();
+  else if (screen == Screen::Toc) renderToc();
   else renderReader();
   present();
   readerNote[0] = '\0';
@@ -323,10 +356,12 @@ void render() {
 
 // ---------------------------------------------------------------- actions
 
-void keepSelectionVisible() {
-  if (selected < scrollTop) scrollTop = selected;
-  if (selected >= scrollTop + VISIBLE_ROWS) scrollTop = selected - VISIBLE_ROWS + 1;
+void keepVisible(int sel, int& top) {
+  if (sel < top) top = sel;
+  if (sel >= top + VISIBLE_ROWS) top = sel - VISIBLE_ROWS + 1;
 }
+
+void keepSelectionVisible() { keepVisible(selected, scrollTop); }
 
 void selectPath(const char* path) {
   for (int i = 0; i < bookCount; i++) {
@@ -402,10 +437,62 @@ void handleLibrary(Button b) {
   keepSelectionVisible();
 }
 
+void openToc() {
+  const auto& ch = book.chapters();
+  if (ch.empty()) {
+    snprintf(readerNote, sizeof(readerNote), "No chapters found");
+    return;
+  }
+  tocCurrent = book.chapterForPage(page);
+  tocSelected = tocCurrent < 0 ? 0 : tocCurrent;
+  tocTop = 0;
+  keepVisible(tocSelected, tocTop);
+  snprintf(status, sizeof(status), "Now on page %d of %d \xE2\x80\x93 rotate to pick a chapter", page + 1,
+           book.pageCount());
+  screen = Screen::Toc;
+}
+
+void closeBook(Button b) {
+  saveProgress();
+  book.close();
+  openBook = -1;
+  screen = b == Button::Menu ? Screen::Library : Screen::Home;
+  snprintf(status, sizeof(status), "%s: closed the book", buttonName(b));
+}
+
+void handleToc(Button b) {
+  const auto& ch = book.chapters();
+  const int count = static_cast<int>(ch.size());
+  switch (b) {
+    case Button::Up:
+      if (tocSelected > 0) tocSelected--;
+      snprintf(status, sizeof(status), "UP: chapter %d of %d", tocSelected + 1, count);
+      break;
+    case Button::Down:
+      if (tocSelected + 1 < count) tocSelected++;
+      snprintf(status, sizeof(status), "DOWN: chapter %d of %d", tocSelected + 1, count);
+      break;
+    case Button::Ok:
+      page = book.pageForOffset(ch[tocSelected].offset);
+      saveProgress();
+      screen = Screen::Reader;
+      break;
+    case Button::Exit:
+      screen = Screen::Reader;  // back to the page we came from
+      break;
+    case Button::Menu:
+      closeBook(b);
+      break;
+  }
+  keepVisible(tocSelected, tocTop);
+}
+
 void handleReader(Button b) {
   switch (b) {
-    case Button::Down:
     case Button::Ok:
+      openToc();
+      break;
+    case Button::Down:
       if (page + 1 < book.pageCount()) {
         page++;
         saveProgress();
@@ -423,11 +510,7 @@ void handleReader(Button b) {
       break;
     case Button::Menu:
     case Button::Exit:
-      saveProgress();
-      book.close();
-      openBook = -1;
-      screen = b == Button::Menu ? Screen::Library : Screen::Home;
-      snprintf(status, sizeof(status), "%s: closed the book", buttonName(b));
+      closeBook(b);
       break;
   }
 }
@@ -450,6 +533,7 @@ bool handle(Button b) {
   }
   lastButton = static_cast<int>(b);
   if (screen == Screen::Library) handleLibrary(b);
+  else if (screen == Screen::Toc) handleToc(b);
   else handleReader(b);
   return true;
 }
