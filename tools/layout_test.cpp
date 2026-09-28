@@ -1,7 +1,8 @@
-// Host-side check of TextLayout.h: every non-whitespace byte appears on
-// exactly one page, in order, and no line exceeds the column budget.
-//   c++ -std=c++17 -Ifirmware_reader/src firmware_reader/tools/layout_test.cpp -o /tmp/layout_test
-//   /tmp/layout_test firmware_reader/src/book.txt
+// Host check of TextLayout.h: across a whole book every visible byte is drawn
+// exactly once, in order, and nothing is drawn outside the text column.
+// Build/run (from repo root), with an extracted EPUB text or a .txt:
+//   c++ -std=c++17 -Ifirmware_reader/src -Ilib/EpdFont firmware_reader/tools/layout_test.cpp \
+//       firmware_reader/src/Font.cpp -o /tmp/layout_test && /tmp/layout_test book.txt
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -9,64 +10,66 @@
 #include <vector>
 
 #include "TextLayout.h"
+#include "fonts/serif9_bold.h"
+#include "fonts/serif9_italic.h"
+#include "fonts/serif9_regular.h"
 
-static std::string squash(const std::string& s) {
+static std::string visibleOnly(const char* s, size_t n) {
   std::string o;
-  for (char c : s)
-    if (c != ' ' && c != '\n') o += c;
+  for (size_t i = 0; i < n; i++)
+    if (s[i] != ' ' && s[i] != '\n' && !markup::isMarker(s[i])) o += s[i];
   return o;
 }
 
-static int check(std::string text, int cols, int lines, bool verbose) {
-  size_t n = text::sanitizeToAscii(text.data(), text.size());
-  text.resize(n);
-  text::reflowIfHardWrapped(text.data(), text.size());
-  for (char c : text)
-    if (c != '\n' && (c < 0x20 || c > 0x7E)) return fprintf(stderr, "non-printable 0x%02x survived\n", (uint8_t)c), 1;
+static int check(std::string text, const char* label, bool isTxt) {
+  if (isTxt) {
+    text.resize(text::prepareTxt(text.data(), text.size()));
+    text::reflowIfHardWrapped(text.data(), text.size());
+  }
+  const text::Fonts fonts{&serif9_regular, &serif9_bold, &serif9_italic, &serif9_bold};
+  const text::Geometry g{376, 270, 25, 20, 6, 18, 4, 10};
 
   std::string emitted;
-  size_t pos = 0;
-  int pages = 0, maxLen = 0;
-  while (pos < text.size()) {
-    size_t next = text::layoutPage(text.data(), text.size(), pos, cols, lines, [&](int, const char* s, int len) {
-      if (len > maxLen) maxLen = len;
-      if ((int)strlen(s) != len) fprintf(stderr, "line not NUL-terminated at len\n");
-      emitted.append(s, len);
-      emitted += '\n';
-      if (verbose && pages == 1) printf("|%-*s|\n", cols, s);
-    });
-    if (next <= pos) {
-      bool onlyWs = true;
-      for (size_t k = pos; k < text.size(); k++) onlyWs &= (text[k] == ' ' || text[k] == '\n');
-      if (onlyWs) break;
-      return fprintf(stderr, "no progress at %zu\n", pos), 1;
-    }
-    pos = next;
+  int pages = 0, overflow = 0, maxLines = 0;
+  text::PageStart ps{0, 0};
+  while (ps.offset < text.size()) {
+    int lines = 0, lastY = -1;
+    auto next = text::layoutPage(text.data(), text.size(), ps, fonts, g,
+                                 [&](const EpdFontData* f, int x, int y, const char* s, size_t n) {
+                                   emitted += visibleOnly(s, n);
+                                   int w = font::textWidth(f, s, n);
+                                   if (x < 0 || x + w > g.width + 1) overflow++;
+                                   if (y != lastY) lines++, lastY = y;
+                                   if (y + g.descent > g.height) overflow++;
+                                 });
+    if (next.offset <= ps.offset) return fprintf(stderr, "%s: no progress at %u\n", label, ps.offset), 1;
+    maxLines = lines > maxLines ? lines : maxLines;
+    ps = next;
     pages++;
   }
-  bool same = squash(emitted) == squash(text);
-  printf("cols=%d lines=%d -> %d pages, longest line %d, content %s\n", cols, lines, pages, maxLen,
+  bool same = emitted == visibleOnly(text.data(), text.size());
+  printf("%s: %d pages, up to %d lines/page, %d out-of-bounds draws, content %s\n", label, pages, maxLines, overflow,
          same ? "OK" : "MISMATCH");
-  return (same && maxLen <= cols) ? 0 : 1;
+  return same && overflow == 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
   int fails = 0;
-  if (argc > 1) {
-    std::ifstream in(argv[1], std::ios::binary);
+  for (int i = 1; i < argc; i++) {
+    std::ifstream in(argv[i], std::ios::binary);
     std::ostringstream ss;
     ss << in.rdbuf();
-    fails += check(ss.str(), 47, 14, true);
-    fails += check(ss.str(), 30, 9, false);
+    std::string name = argv[i];
+    fails += check(ss.str(), argv[i], name.size() > 4 && name.substr(name.size() - 4) == ".txt");
   }
   std::string wrapped;
   for (int p = 0; p < 30; p++) {
     for (int l = 0; l < 5; l++) wrapped += "It was a dark and stormy night; the rain fell in torrents,\n";
     wrapped += "\n";
   }
-  fails += check(wrapped, 47, 14, false);
-  fails += check("Supercalifragilisticexpialidocious-antidisestablishmentarianism-pneumonoultramicroscopic ok", 20, 3, false);
-  fails += check("caf\xC3\xA9 \xE2\x80\x9Cquoted\xE2\x80\x9D \xE2\x80\x94 dash\xE2\x80\xA6 bad\xFF byte", 47, 14, false);
+  fails += check(wrapped, "hard-wrapped", true);
+  fails += check("\x05\x01" "Chapter One\x02\n\nA \x03word\x04, then \x01" "bold\x02.\n\n\x0C\x05Two\n\nEnd",
+                 "markup", false);
   printf(fails ? "FAILED\n" : "ALL PASSED\n");
   return fails ? 1 : 0;
 }

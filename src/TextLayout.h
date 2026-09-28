@@ -1,66 +1,33 @@
 #pragma once
 
-// Text cleanup + word-wrap pagination for the vendor's monospace bitmap font.
-// Pure C++ (no Arduino) so tools/layout_test.cpp can exercise it on the host.
+// Page layout for book text (UTF-8 + Markup.h markers) with proportional
+// fonts: greedy word wrap, justified lines, first-line indents, centered bold
+// headings. Pure C++ so tools/layout_test.cpp can run it on the host.
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "Font.h"
+#include "Markup.h"
+
 namespace text {
 
-// The vendor font only has glyphs for 0x20..0x7E; anything else would index
-// past the end of the font tables. Rewrites `buf` in place to printable ASCII
-// plus '\n' (common UTF-8 punctuation mapped to ASCII look-alikes) and returns
-// the new length. Output is never longer than input.
-inline size_t sanitizeToAscii(char* buf, size_t len) {
-  static constexpr char LATIN1[] =  // U+00C0..U+00FF
-      "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPs"
-      "aaaaaaaceeeeiiiidnooooo/ouuuuypy";
+// TXT input: drops '\r' and control bytes (which would collide with markers),
+// turns tabs into spaces. Returns the new length.
+inline size_t prepareTxt(char* buf, size_t len) {
   size_t out = 0;
-  size_t i = 0;
-  auto u8 = [&](size_t k) { return static_cast<uint8_t>(buf[k]); };
-  while (i < len) {
-    uint8_t c = u8(i);
-    if (c < 0x80) {
-      i++;
-      if (c == '\n' || (c >= 0x20 && c < 0x7F)) buf[out++] = static_cast<char>(c);
-      else if (c == '\t') buf[out++] = ' ';
-      continue;
-    }
-    int n = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 0;
-    bool valid = n > 0 && i + n <= len;
-    uint32_t cp = valid ? (c & (0x7F >> n)) : 0;
-    for (int k = 1; valid && k < n; k++) {
-      if ((u8(i + k) & 0xC0) != 0x80) valid = false;
-      cp = (cp << 6) | (u8(i + k) & 0x3F);
-    }
-    if (!valid) {
-      buf[out++] = '?';
-      i++;
-      continue;
-    }
-    i += n;
-    switch (cp) {
-      case 0x00A0: buf[out++] = ' '; break;
-      case 0x00AD: case 0xFEFF: case 0x200B: break;
-      case 0x2018: case 0x2019: case 0x201A: case 0x2032: buf[out++] = '\''; break;
-      case 0x201C: case 0x201D: case 0x201E: case 0x2033: buf[out++] = '"'; break;
-      case 0x2010: case 0x2011: case 0x2012: case 0x2013: buf[out++] = '-'; break;
-      case 0x2014: case 0x2015: buf[out++] = '-'; buf[out++] = '-'; break;
-      case 0x2026: buf[out++] = '.'; buf[out++] = '.'; buf[out++] = '.'; break;
-      default:
-        buf[out++] = (cp >= 0xC0 && cp <= 0xFF) ? LATIN1[cp - 0xC0] : '?';
-        break;
-    }
+  for (size_t i = 0; i < len; i++) {
+    const char c = buf[i];
+    if (c == '\t') buf[out++] = ' ';
+    else if (c == '\n' || static_cast<unsigned char>(c) >= 0x20) buf[out++] = c;
   }
   return out;
 }
 
 // Project Gutenberg-style files hard-wrap paragraphs at ~70 columns with blank
-// lines between paragraphs. Reflowing those (single '\n' -> ' ') lets text fill
-// the screen width instead of leaving ragged half-lines. Files that already put
-// one paragraph per line are left alone.
+// lines between paragraphs; reflow those (single '\n' -> ' ') so text fills
+// the line. Files that already put one paragraph per line are left alone.
 inline void reflowIfHardWrapped(char* buf, size_t len) {
   size_t nonEmpty = 0, wrappedLen = 0, blank = 0, lineStart = 0;
   for (size_t i = 0; i <= len; i++) {
@@ -83,76 +50,202 @@ inline void reflowIfHardWrapped(char* buf, size_t len) {
   }
 }
 
-static constexpr int MAX_COLS = 64;
+struct Fonts {
+  const EpdFontData* regular;
+  const EpdFontData* bold;
+  const EpdFontData* italic;
+  const EpdFontData* boldItalic;
+  const EpdFontData* pick(uint8_t style) const;
+};
 
-// Lays out one page starting at byte `start`. Calls drawLine(lineIdx, text, n)
-// for every emitted line (n == 0 for a blank paragraph gap) and returns the
-// byte offset where the next page begins. Every non-whitespace byte in
-// [start, return) is emitted exactly once; words wider than a line are split.
-template <typename DrawLineFn>
-size_t layoutPage(const char* t, size_t len, size_t start, int cols, int lines, DrawLineFn drawLine) {
-  if (cols > MAX_COLS) cols = MAX_COLS;
-  size_t pos = start;
-  while (pos < len && (t[pos] == '\n' || t[pos] == ' ')) pos++;
+struct Geometry {
+  int width;       // text column width in pixels
+  int height;      // text area height in pixels
+  int lineHeight;  // baseline-to-baseline
+  int ascent;      // top of line box to baseline
+  int descent;     // baseline to lowest descender (positive)
+  int indent;      // first-line indent
+  int paraGap;     // extra space after a paragraph
+  int headingGap;  // extra space before/after a heading
+};
 
-  char lineBuf[MAX_COLS + 1];
-  int lineLen = 0;
-  int line = 0;
-  auto flush = [&]() {
-    lineBuf[lineLen] = '\0';
-    drawLine(line, lineBuf, lineLen);
-    lineLen = 0;
-    line++;
-  };
+// Layout state carried from one page to the next.
+enum : uint8_t { S_BOLD = 1, S_ITALIC = 2, S_MID_PARA = 4, S_NO_INDENT = 8, S_HEADING = 16 };
 
-  while (pos < len && line < lines) {
-    char c = t[pos];
-    if (c == '\n') {
-      size_t runStart = pos;
-      while (pos < len && t[pos] == '\n') pos++;
-      bool paragraph = (pos - runStart) > 1;
-      if (lineLen > 0 || !paragraph) flush();
-      // No gap at the top of a page, and none as the last line (it would waste it).
-      if (paragraph && line > 0 && line < lines - 1) flush();
-      continue;
-    }
-    if (c == ' ') {
-      pos++;
-      continue;
-    }
-    size_t wordStart = pos;
-    while (pos < len && t[pos] != ' ' && t[pos] != '\n') pos++;
-    int wordLen = static_cast<int>(pos - wordStart);
+struct PageStart {
+  uint32_t offset;
+  uint8_t state;
+};
 
-    int need = (lineLen > 0 ? 1 : 0) + wordLen;
-    if (lineLen + need > cols) {
-      if (wordLen > cols) {
-        // Split an over-long token across lines instead of dropping it.
-        if (lineLen > 0 && cols - lineLen - 1 < 4) {
-          flush();
-          pos = wordStart;
-          continue;
+// Lays out one page. draw(font, x, baselineY, text, len) is called per run of
+// same-style text (pass a no-op to only measure). Returns where the next page
+// starts; offset == len means the book ends on this page.
+template <typename DrawFn>
+PageStart layoutPage(const char* t, size_t len, PageStart start, const Fonts& fonts, const Geometry& g, DrawFn draw);
+
+// Implementation --------------------------------------------------------------
+
+inline const EpdFontData* Fonts::pick(uint8_t style) const {
+  const bool b = style & S_BOLD, i = style & S_ITALIC;
+  return b && i ? boldItalic : b ? bold : i ? italic : regular;
+}
+
+namespace detail {
+
+constexpr int MAX_RUNS = 96;
+constexpr int MAX_WORDS = 64;
+
+struct Run {
+  uint32_t off;
+  uint16_t len;
+  uint8_t style;
+  int16_t x;  // relative to its word
+};
+
+struct Word {
+  uint8_t firstRun, runCount;
+  int16_t width;
+};
+
+inline bool isVisibleStart(char c) { return c != ' ' && c != '\n' && c != markup::PAGE_BREAK && !markup::isMarker(c); }
+
+inline void applyMarker(char c, uint8_t& state) {
+  if (c == markup::BOLD_ON) state |= S_BOLD;
+  else if (c == markup::BOLD_OFF) state &= ~S_BOLD;
+  else if (c == markup::ITALIC_ON) state |= S_ITALIC;
+  else if (c == markup::ITALIC_OFF) state &= ~S_ITALIC;
+}
+
+}  // namespace detail
+
+template <typename DrawFn>
+PageStart layoutPage(const char* t, size_t len, PageStart start, const Fonts& fonts, const Geometry& g, DrawFn draw) {
+  using namespace detail;
+  size_t pos = start.offset;
+  uint8_t state = start.state;
+  int y = 0;
+  bool pageHasText = false;
+
+  Run runs[MAX_RUNS];
+  Word words[MAX_WORDS];
+
+  while (pos < len) {
+    // Paragraph start: skip separators, pick up the heading flag.
+    if (!(state & S_MID_PARA)) {
+      while (pos < len && (t[pos] == '\n' || t[pos] == ' ' || markup::isMarker(t[pos]) || t[pos] == markup::PAGE_BREAK)) {
+        if (t[pos] == markup::PAGE_BREAK) {
+          state = (state & (S_BOLD | S_ITALIC)) | S_NO_INDENT;
+          if (pageHasText) return {static_cast<uint32_t>(pos + 1), state};
+        } else if (t[pos] == markup::HEADING) {
+          state |= S_HEADING;
+        } else {
+          applyMarker(t[pos], state);
         }
-        if (lineLen > 0) lineBuf[lineLen++] = ' ';
-        int take = cols - lineLen;
-        memcpy(lineBuf + lineLen, t + wordStart, take);
-        lineLen += take;
-        pos = wordStart + take;
-        flush();
+        pos++;
+      }
+      if (pos >= len) break;
+      if ((state & S_HEADING) && pageHasText) y += g.headingGap;
+    }
+
+    // Build one line.
+    const size_t lineStart = pos;
+    const uint8_t lineState = state;
+    const bool heading = state & S_HEADING;
+    const bool firstLine = !(state & S_MID_PARA);
+    const int indent = (firstLine && !heading && !(state & S_NO_INDENT)) ? g.indent : 0;
+    const int avail = g.width - indent;
+    int nRuns = 0, nWords = 0, lineW = 0;
+    bool endsParagraph = false, hardBreak = false;
+    const int spaceW = font::textWidth(fonts.regular, " ", 1);
+
+    while (pos < len) {
+      const char c = t[pos];
+      if (c == ' ') {
+        pos++;
         continue;
       }
-      flush();
-      if (line >= lines) {
-        pos = wordStart;
+      if (c == '\n' || c == markup::PAGE_BREAK) {
+        if (c == '\n' && !(pos + 1 < len && t[pos + 1] == '\n')) {
+          hardBreak = true;
+          pos++;
+        } else {
+          endsParagraph = true;
+          if (c == '\n') pos += 2;  // PAGE_BREAK is handled at the next paragraph start
+        }
         break;
       }
+      if (markup::isMarker(c)) {
+        applyMarker(c, state);
+        pos++;
+        continue;
+      }
+
+      // One word, possibly spanning several style runs.
+      const size_t wordStart = pos;
+      const uint8_t wordState = state;
+      const int runBase = nRuns;
+      int wordW = 0;
+      while (pos < len && t[pos] != ' ' && t[pos] != '\n' && t[pos] != markup::PAGE_BREAK) {
+        if (markup::isMarker(t[pos])) {
+          applyMarker(t[pos], state);
+          pos++;
+          continue;
+        }
+        const size_t runStart = pos;
+        while (pos < len && isVisibleStart(t[pos])) pos++;
+        if (nRuns < MAX_RUNS) {
+          const uint8_t st = state | (heading ? S_BOLD : 0);
+          const int w = font::textWidth(fonts.pick(st), t + runStart, pos - runStart);
+          runs[nRuns++] = {static_cast<uint32_t>(runStart), static_cast<uint16_t>(pos - runStart), st,
+                           static_cast<int16_t>(wordW)};
+          wordW += w;
+        }
+      }
+      const int needed = (nWords ? spaceW : 0) + wordW;
+      if (nWords > 0 && (lineW + needed > avail || nWords == MAX_WORDS || nRuns == MAX_RUNS)) {
+        pos = wordStart;  // doesn't fit: next line starts with this word
+        state = wordState;
+        nRuns = runBase;
+        break;
+      }
+      words[nWords++] = {static_cast<uint8_t>(runBase), static_cast<uint8_t>(nRuns - runBase),
+                         static_cast<int16_t>(wordW)};
+      lineW += needed;
     }
-    if (lineLen > 0) lineBuf[lineLen++] = ' ';
-    memcpy(lineBuf + lineLen, t + wordStart, wordLen);
-    lineLen += wordLen;
+    if (pos >= len) endsParagraph = true;
+
+    if (nWords == 0) {
+      state = endsParagraph ? (state & (S_BOLD | S_ITALIC)) : (state | S_MID_PARA);
+      continue;  // blank line or empty paragraph: nothing to draw
+    }
+    if (y + g.ascent + g.descent > g.height) return {static_cast<uint32_t>(lineStart), lineState};
+
+    // Justify full lines; the last line of a paragraph, hard breaks and headings stay natural.
+    const bool justify = !endsParagraph && !hardBreak && !heading && nWords > 1;
+    const int gaps = nWords - 1;
+    const int slack = avail - lineW;
+    int x = heading ? (g.width - lineW) / 2 : indent;
+    for (int w = 0; w < nWords; w++) {
+      for (int r = 0; r < words[w].runCount; r++) {
+        const Run& run = runs[words[w].firstRun + r];
+        draw(fonts.pick(run.style), x + run.x, y + g.ascent, t + run.off, run.len);
+      }
+      x += words[w].width + spaceW;
+      if (justify) x += slack / gaps + (w < slack % gaps ? 1 : 0);
+    }
+    y += g.lineHeight;
+    pageHasText = true;
+
+    if (endsParagraph) {
+      y += heading ? g.headingGap : g.paraGap;
+      state &= S_BOLD | S_ITALIC;
+      if (heading) state |= S_NO_INDENT;
+    } else {
+      state = (state & ~S_NO_INDENT) | S_MID_PARA;
+      if (heading) state |= S_HEADING;
+    }
   }
-  if (lineLen > 0) flush();
-  return pos;
+  return {static_cast<uint32_t>(len), state};
 }
 
 }  // namespace text
