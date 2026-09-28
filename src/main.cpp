@@ -1,7 +1,8 @@
 // Book reader firmware for the Elecrow CrowPanel 4.2" (green-sticker V1.2A).
 //
 // Boot -> Home screen: /bg.jpg from the SD card root. MENU opens the library.
-// Library: pick a .epub or .txt book from the SD card (or the built-in one).
+// Library: pick a .epub or .txt book from the SD card (or the built-in one),
+// or the top row "Add books over Wi-Fi" to upload books from a phone.
 // The selected row is inverted and a 5-key bar at the bottom highlights the
 // last button pressed, with a status line saying what it did. EXIT goes home.
 // Reader: rotary DOWN = next page, rotary UP = previous page, rotary press =
@@ -11,12 +12,14 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SD.h>
+#include <qrcode.h>
 
 #include "Book.h"
 #include "Buttons.h"
 #include "Font.h"
 #include "HomeImage.h"
 #include "Library.h"
+#include "Transfer.h"
 #include "BigAlloc.h"
 #include "fonts/sans11_bold.h"
 #include "fonts/sans7_bold.h"
@@ -69,12 +72,15 @@ constexpr int VISIBLE_ROWS = (STATUS_RULE_Y - LIST_TOP) / ROW_H;
 // Bar order matches Button enum order.
 constexpr const char* LIBRARY_KEY_ACTIONS[BUTTON_COUNT] = {"Rescan", "Prev", "Open", "Next", "Home"};
 constexpr const char* TOC_KEY_ACTIONS[BUTTON_COUNT] = {"Library", "Prev", "Go", "Next", "Back"};
+constexpr const char* TRANSFER_KEY_ACTIONS[BUTTON_COUNT] = {"", "", "", "", "Done"};
+constexpr int WIFI_ROW = 0;   // library row 0 is "Add books over Wi-Fi"; books follow
+constexpr int FIRST_BOOK_ROW = 1;
 constexpr int TOC_INDENT = 14;
 
 uint8_t imageBuf[(EPD_W * EPD_H) / 8];
 const font::Canvas canvas{imageBuf, EPD_W, EPD_H};
 
-enum class Screen { Home, Library, Reader, Toc };
+enum class Screen { Home, Library, Reader, Toc, Transfer };
 
 constexpr const char* HOME_IMAGE_PATH = "/bg.jpg";
 constexpr size_t MAX_HOME_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -87,7 +93,7 @@ struct Progress {
 Preferences prefs;
 BookEntry books[MAX_BOOKS];
 int bookCount = 0;
-int selected = 0;
+int selected = FIRST_BOOK_ROW;  // library row; books[selected - FIRST_BOOK_ROW]
 int scrollTop = 0;
 bool sdOk = false;
 
@@ -99,6 +105,7 @@ int tocTop = 0;
 int tocCurrent = -1;  // chapter containing the page the contents were opened from
 
 Screen screen = Screen::Home;
+transfer::Info wifi;
 
 // Decoded home image, kept so returning home doesn't re-decode the JPEG.
 uint8_t homeFrame[(EPD_W * EPD_H) / 8];
@@ -200,28 +207,11 @@ void saveProgress() {
 
 // Title bar, scrolling rows, status line and 5-key bar shared by the library
 // and contents screens. drawRow(index, y, selected) draws one row's content.
-template <typename RowFn>
-void drawListScreen(const char* title, int sel, int count, int top, const char* statusText,
-                    const char* const* actions, RowFn drawRow) {
-  clear();
+// Title bar, status line and 5-key bar (the last pressed key inverted).
+void drawChrome(const char* title, const char* counter, const char* statusText, const char* const* actions) {
   fillRect(0, 0, SCREEN_W, TITLE_BAR_H, true);
   drawText(UI_TITLE, MARGIN_X, 23, title, true);
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%d / %d", sel + 1, count);
-  drawRight(UI, SCREEN_W - MARGIN_X, 20, buf, true);
-
-  for (int r = 0; r < VISIBLE_ROWS && top + r < count; r++) {
-    const int y = LIST_TOP + r * ROW_H;
-    const bool isSel = top + r == sel;
-    if (isSel) fillRect(0, y, SCREEN_W, y + ROW_H - 2, true);
-    drawRow(top + r, y, isSel);
-  }
-  if (count > VISIBLE_ROWS) {  // scrollbar thumb in the right margin
-    const int trackH = VISIBLE_ROWS * ROW_H - 2;
-    const int thumbH = trackH * VISIBLE_ROWS / count < 8 ? 8 : trackH * VISIBLE_ROWS / count;
-    const int thumbY = LIST_TOP + (trackH - thumbH) * top / (count - VISIBLE_ROWS);
-    fillRect(SCREEN_W - 4, thumbY, SCREEN_W - 1, thumbY + thumbH, true);
-  }
+  if (counter[0]) drawRight(UI, SCREEN_W - MARGIN_X, 20, counter, true);
 
   hRule(STATUS_RULE_Y);
   char line[112];
@@ -238,6 +228,28 @@ void drawListScreen(const char* title, int sel, int count, int top, const char* 
   }
 }
 
+template <typename RowFn>
+void drawListScreen(const char* title, int sel, int count, int top, const char* statusText,
+                    const char* const* actions, RowFn drawRow) {
+  clear();
+  char counter[32];
+  snprintf(counter, sizeof(counter), "%d / %d", sel + 1, count);
+  drawChrome(title, counter, statusText, actions);
+
+  for (int r = 0; r < VISIBLE_ROWS && top + r < count; r++) {
+    const int y = LIST_TOP + r * ROW_H;
+    const bool isSel = top + r == sel;
+    if (isSel) fillRect(0, y, SCREEN_W, y + ROW_H - 2, true);
+    drawRow(top + r, y, isSel);
+  }
+  if (count > VISIBLE_ROWS) {  // scrollbar thumb in the right margin
+    const int trackH = VISIBLE_ROWS * ROW_H - 2;
+    const int thumbH = trackH * VISIBLE_ROWS / count < 8 ? 8 : trackH * VISIBLE_ROWS / count;
+    const int thumbY = LIST_TOP + (trackH - thumbH) * top / (count - VISIBLE_ROWS);
+    fillRect(SCREEN_W - 4, thumbY, SCREEN_W - 1, thumbY + thumbH, true);
+  }
+}
+
 // One list row: optional left marker, title (ellipsized), optional right label.
 void drawRow(int y, bool sel, int indent, const char* marker, const char* title, const char* right) {
   const int rightW = right[0] ? textWidth(UI, right) + 10 : 0;
@@ -249,13 +261,61 @@ void drawRow(int y, bool sel, int indent, const char* marker, const char* title,
 }
 
 void renderLibrary() {
-  drawListScreen("Library", selected, bookCount, scrollTop, status, LIBRARY_KEY_ACTIONS, [](int i, int y, bool sel) {
+  const int rows = bookCount + FIRST_BOOK_ROW;
+  drawListScreen("Library", selected, rows, scrollTop, status, LIBRARY_KEY_ACTIONS, [](int row, int y, bool sel) {
+    if (row == WIFI_ROW) {
+      drawRow(y, sel, 0, "+", "Add books over Wi-Fi", "");
+      return;
+    }
+    const BookEntry& b = books[row - FIRST_BOOK_ROW];
     char right[16] = "";
     Progress p;
-    if (loadProgress(books[i], p)) snprintf(right, sizeof(right), "%u%%", p.percent);
-    else if (books[i].epub) snprintf(right, sizeof(right), "EPUB");
-    drawRow(y, sel, 0, sel ? "\xE2\x80\xBA" : "", books[i].title, right);  // "›"
+    if (loadProgress(b, p)) snprintf(right, sizeof(right), "%u%%", p.percent);
+    else if (b.epub) snprintf(right, sizeof(right), "EPUB");
+    drawRow(y, sel, 0, sel ? "\xE2\x80\xBA" : "", b.title, right);  // "›"
   });
+}
+
+// QR code with its top-left at (x, y), modules scaled to fit maxSize pixels.
+void drawQr(int x, int y, int maxSize, const char* text) {
+  // ricmoo/QRCode does not check capacity (oversized input overruns its
+  // buffers), so pick the version here. Byte-mode capacity at ECC_LOW:
+  static constexpr uint8_t CAPACITY[] = {17, 32, 53, 78, 106, 134};
+  const size_t len = strlen(text);
+  for (uint8_t version = 1; version <= sizeof(CAPACITY); version++) {
+    if (len > CAPACITY[version - 1]) continue;
+    uint8_t data[qrcode_getBufferSize(sizeof(CAPACITY))];
+    QRCode qr;
+    if (qrcode_initText(&qr, data, version, ECC_LOW, text) != 0) return;
+    const int px = maxSize / qr.size;
+    const int size = qr.size * px;
+    const int x0 = x + (maxSize - size) / 2;
+    for (uint8_t cy = 0; cy < qr.size; cy++) {
+      for (uint8_t cx = 0; cx < qr.size; cx++) {
+        if (qrcode_getModule(&qr, cx, cy)) fillRect(x0 + cx * px, y + cy * px, x0 + (cx + 1) * px, y + (cy + 1) * px, true);
+      }
+    }
+    return;
+  }
+}
+
+void renderTransfer() {
+  clear();
+  drawChrome("Wi-Fi transfer", "", transfer::lastMessage(), TRANSFER_KEY_ACTIONS);
+
+  char joinQr[80];
+  snprintf(joinQr, sizeof(joinQr), "WIFI:T:WPA;S:%s;P:%s;;", wifi.ssid, wifi.password);
+  constexpr int QR = 124, COL = SCREEN_W / 2;
+  drawQr((COL - QR) / 2, 36, QR, joinQr);
+  drawQr(COL + (COL - QR) / 2, 36, QR, wifi.url);
+  drawCentered(UI_BOLD, 0, COL, 180, "1. Scan to join Wi-Fi");
+  drawCentered(UI_BOLD, COL, COL, 180, "2. Scan to open page");
+
+  char line[112];
+  snprintf(line, sizeof(line), "Wi-Fi  %s   \xC2\xB7   Password  %s", wifi.ssid, wifi.password);
+  drawCentered(UI, 0, SCREEN_W, 206, line);
+  snprintf(line, sizeof(line), "Then open  %s  in your browser", wifi.url);
+  drawCentered(UI, 0, SCREEN_W, 228, line);
 }
 
 void renderToc() {
@@ -349,6 +409,7 @@ void render() {
   if (screen == Screen::Home) renderHome();
   else if (screen == Screen::Library) renderLibrary();
   else if (screen == Screen::Toc) renderToc();
+  else if (screen == Screen::Transfer) renderTransfer();
   else renderReader();
   present();
   readerNote[0] = '\0';
@@ -363,11 +424,12 @@ void keepVisible(int sel, int& top) {
 
 void keepSelectionVisible() { keepVisible(selected, scrollTop); }
 
+const char* bookKey(const BookEntry& e) { return e.builtIn ? "<builtin>" : e.path; }
+
 void selectPath(const char* path) {
   for (int i = 0; i < bookCount; i++) {
-    const char* p = books[i].builtIn ? "<builtin>" : books[i].path;
-    if (strcmp(p, path) == 0) {
-      selected = i;
+    if (strcmp(bookKey(books[i]), path) == 0) {
+      selected = i + FIRST_BOOK_ROW;
       break;
     }
   }
@@ -375,49 +437,67 @@ void selectPath(const char* path) {
 }
 
 void rescan() {
-  char keep[160];
-  snprintf(keep, sizeof(keep), "%s", books[selected].builtIn ? "<builtin>" : books[selected].path);
+  char keep[160] = "";
+  if (selected >= FIRST_BOOK_ROW) snprintf(keep, sizeof(keep), "%s", bookKey(books[selected - FIRST_BOOK_ROW]));
+  const bool onWifiRow = selected == WIFI_ROW;
   sdOk = libraryMountSd();
   bookCount = libraryScan(books, MAX_BOOKS, sdOk);
-  selected = 0;
+  selected = onWifiRow ? WIFI_ROW : FIRST_BOOK_ROW;
   scrollTop = 0;
   selectPath(keep);
 }
 
+void startTransfer() {
+  if (!sdOk) {
+    snprintf(status, sizeof(status), "Insert an SD card to add books");
+    return;
+  }
+  if (!transfer::start(wifi)) {
+    snprintf(status, sizeof(status), "Wi-Fi could not start");
+    return;
+  }
+  screen = Screen::Transfer;
+}
+
+void stopTransfer() {
+  transfer::stop();
+  const int added = transfer::receivedCount();
+  if (transfer::libraryChanged()) rescan();
+  if (added) snprintf(status, sizeof(status), "Added %d book%s over Wi-Fi", added, added == 1 ? "" : "s");
+  else snprintf(status, sizeof(status), "Wi-Fi off");
+  screen = Screen::Library;
+}
+
 bool openSelected() {
-  const BookEntry& e = books[selected];
+  const BookEntry& e = books[selected - FIRST_BOOK_ROW];
   // First open of an EPUB extracts every chapter; say so rather than look frozen.
   if (bookNeedsExtraction(e)) renderMessage("Opening\xE2\x80\xA6", e.title);
   if (!book.open(e, BOOK_FONTS, BOOK_GEOMETRY)) {
     Serial.printf("[book] open '%s' failed: %s\n", e.title, book.error());
     return false;
   }
-  openBook = selected;
+  openBook = selected - FIRST_BOOK_ROW;
   Progress p;
   page = loadProgress(e, p) ? book.pageForOffset(p.offset) : 0;
-  prefs.putString("last", e.builtIn ? "<builtin>" : e.path);
+  prefs.putString("last", bookKey(e));
   return true;
 }
 
 void handleLibrary(Button b) {
   switch (b) {
     case Button::Up:
-      if (selected > 0) {
-        selected--;
-        snprintf(status, sizeof(status), "UP: book %d of %d", selected + 1, bookCount);
-      } else {
-        snprintf(status, sizeof(status), "UP: already at the first book");
-      }
+    case Button::Down: {
+      const int next = selected + (b == Button::Up ? -1 : 1);
+      if (next >= 0 && next < bookCount + FIRST_BOOK_ROW) selected = next;
+      if (selected == WIFI_ROW) snprintf(status, sizeof(status), "%s: press to add books from your phone", buttonName(b));
+      else snprintf(status, sizeof(status), "%s: book %d of %d", buttonName(b), selected, bookCount);
       break;
-    case Button::Down:
-      if (selected + 1 < bookCount) {
-        selected++;
-        snprintf(status, sizeof(status), "DOWN: book %d of %d", selected + 1, bookCount);
-      } else {
-        snprintf(status, sizeof(status), "DOWN: already at the last book");
-      }
-      break;
+    }
     case Button::Ok:
+      if (selected == WIFI_ROW) {
+        startTransfer();
+        return;
+      }
       if (openSelected()) {
         screen = Screen::Reader;
         snprintf(status, sizeof(status), "OK: opened \xE2\x80\x9C%.60s\xE2\x80\x9D", books[openBook].title);
@@ -531,6 +611,12 @@ bool handle(Button b) {
     lastButton = static_cast<int>(b);
     return true;
   }
+  if (screen == Screen::Transfer) {
+    if (b != Button::Exit) return false;  // only EXIT ("Done") acts here
+    lastButton = static_cast<int>(b);
+    stopTransfer();
+    return true;
+  }
   lastButton = static_cast<int>(b);
   if (screen == Screen::Library) handleLibrary(b);
   else if (screen == Screen::Toc) handleToc(b);
@@ -569,7 +655,15 @@ void setup() {
 
 void loop() {
   Button b;
-  if (!buttonsNext(b, portMAX_DELAY)) return;
+  // While the Wi-Fi transfer screen is up, serve the phone between key checks.
+  const bool serving = screen == Screen::Transfer;
+  if (!buttonsNext(b, serving ? pdMS_TO_TICKS(5) : portMAX_DELAY)) {
+    if (serving) {
+      transfer::poll();
+      if (transfer::takeSettledChange()) render();
+    }
+    return;
+  }
   bool dirty = handle(b);
   // Apply presses made during the last refresh, then draw once.
   while (buttonsNext(b, 0)) dirty |= handle(b);
