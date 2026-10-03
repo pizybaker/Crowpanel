@@ -7,7 +7,7 @@ E-reader firmware for the **Elecrow CrowPanel ESP32 4.2" E-Paper HMI** (400×300
 ## Features
 
 - **EPUB and TXT books.** EPUB chapters are read in spine order, keeping paragraphs, headings, bold and italic. Each chapter starts on a new page.
-- **Book typography.** Noto Serif with kerning, justified lines and first-line indents. Noto Sans for menus.
+- **Typography.** Merriweather throughout: 11 pt for books, with kerning, justified lines and first-line indents.
 - **Chapter contents.** Jump to any chapter from the book's table of contents (EPUB 3 nav or EPUB 2 NCX). Books without one fall back to their headings.
 - **Wi-Fi upload.** The reader starts its own hotspot. Scan a QR code to join, scan another to open an upload page, and send books from your phone.
 - **Wallpapers.** Upload images from your phone and pick which one is the home screen, or put a `bg.jpg` on the SD card. Images are scaled to fit and dithered for e-paper.
@@ -80,12 +80,24 @@ pio device monitor           # serial log, 115200 baud
 
 ### Regenerating fonts
 
+The reader uses Merriweather (`merri11_regular/bold/italic` for books,
+`merri9_regular` for lists, `merri7_regular/bold` and `merri11_bold` for the
+interface), from the variable fonts in
+[google/fonts](https://github.com/google/fonts/tree/main/ofl/merriweather):
+
 ```sh
 pip install freetype-py fonttools
-python tools/fontconvert.py serif9_regular 9 NotoSerif-Regular.ttf --pnum --mono-threshold 4 > src/fonts/serif9_regular.h
+# Pin the variable font to one style (Bold: wght=700; Italic: use Merriweather-Italic[...].ttf)
+fonttools varLib.instancer "Merriweather[opsz,wdth,wght].ttf" wght=400 wdth=100 opsz=18 -o Merriweather-Regular.ttf
+# Kern only Latin-1, so the kerning fits the font format's 255 classes
+python tools/split_font.py Merriweather-Regular.ttf Merriweather-Regular
+python tools/fontconvert.py merri11_regular 11 Merriweather-Regular-Kern.ttf Merriweather-Regular-Rest.ttf \
+  --pnum --mono-threshold 4 > src/fonts/merri11_regular.h
 ```
 
 Sizes are at 150 DPI. `--mono-threshold 4` keeps small text crisp on this panel.
+If you change the book font, update `BOOK_GEOMETRY` in `src/main.cpp` (line
+height, ascent, descent) and the matching line in `tools/layout_test.cpp`.
 
 ### Host test
 
@@ -97,7 +109,7 @@ c++ -std=c++17 -Isrc -Iinclude tools/layout_test.cpp src/Font.cpp -o /tmp/layout
 ## Credits and licences
 
 - `include/EpdFontData.h` and `tools/fontconvert.py` come from [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) (MIT, see `LICENSES/MIT-CrossPoint.txt`), originally from [epdiy](https://github.com/vroland/epdiy).
-- Fonts in `src/fonts/` are generated from Noto Serif and Noto Sans (SIL Open Font License, see `LICENSES/OFL-Noto.txt`).
+- Fonts in `src/fonts/` are generated from Merriweather (see `LICENSES/OFL-Merriweather.txt`), Noto Serif and Noto Sans (see `LICENSES/OFL-Noto.txt`), all under the SIL Open Font License. The font-test firmware's fonts in `src/fonttest/fonts/` come from their own OFL font families.
 - `lib/uzlib` is [uzlib](https://github.com/pfalcon/uzlib) (zlib licence).
 - [JPEGDEC](https://github.com/bitbank2/JPEGDEC) (Apache 2.0) and [QRCode](https://github.com/ricmoo/QRCode) (MIT) are fetched by PlatformIO.
 - `src/vendor/EPD_SPI.*` and the panel register sequence in `src/vendor/EPD.cpp` are based on Elecrow's CrowPanel example code.

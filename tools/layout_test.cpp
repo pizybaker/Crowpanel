@@ -10,9 +10,9 @@
 #include <vector>
 
 #include "TextLayout.h"
-#include "fonts/serif9_bold.h"
-#include "fonts/serif9_italic.h"
-#include "fonts/serif9_regular.h"
+#include "fonts/merri11_bold.h"
+#include "fonts/merri11_italic.h"
+#include "fonts/merri11_regular.h"
 
 static std::string visibleOnly(const char* s, size_t n) {
   std::string o;
@@ -26,8 +26,8 @@ static int check(std::string text, const char* label, bool isTxt) {
     text.resize(text::prepareTxt(text.data(), text.size()));
     text::reflowIfHardWrapped(text.data(), text.size());
   }
-  const text::Fonts fonts{&serif9_regular, &serif9_bold, &serif9_italic, &serif9_bold};
-  const text::Geometry g{376, 270, 25, 20, 6, 18, 4, 10};
+  const text::Fonts fonts{&merri11_regular, &merri11_bold, &merri11_italic, &merri11_bold};
+  const text::Geometry g{376, 272, 28, 23, 7, 22, 3, 10};
 
   std::string emitted;
   int pages = 0, overflow = 0, maxLines = 0;

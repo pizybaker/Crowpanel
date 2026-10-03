@@ -23,12 +23,12 @@
 #include "Transfer.h"
 #include "Wallpaper.h"
 #include "BigAlloc.h"
-#include "fonts/sans11_bold.h"
-#include "fonts/sans7_bold.h"
-#include "fonts/sans7_regular.h"
-#include "fonts/serif9_bold.h"
-#include "fonts/serif9_italic.h"
-#include "fonts/serif9_regular.h"
+#include "fonts/merri11_bold.h"
+#include "fonts/merri11_italic.h"
+#include "fonts/merri11_regular.h"
+#include "fonts/merri7_bold.h"
+#include "fonts/merri7_regular.h"
+#include "fonts/merri9_regular.h"
 #include "vendor/EPD.h"
 
 namespace {
@@ -38,11 +38,11 @@ constexpr int PIN_PWR_PANEL = 7;
 
 constexpr int SCREEN_W = EPD_W;
 
-const EpdFontData* const UI = &sans7_regular;
-const EpdFontData* const UI_BOLD = &sans7_bold;
-const EpdFontData* const UI_TITLE = &sans11_bold;
-const EpdFontData* const BODY = &serif9_regular;
-const text::Fonts BOOK_FONTS{&serif9_regular, &serif9_bold, &serif9_italic, &serif9_bold};
+const EpdFontData* const UI = &merri7_regular;
+const EpdFontData* const UI_BOLD = &merri7_bold;
+const EpdFontData* const UI_TITLE = &merri11_bold;
+const EpdFontData* const BODY = &merri9_regular;
+const text::Fonts BOOK_FONTS{&merri11_regular, &merri11_bold, &merri11_italic, &merri11_bold};
 
 // Reader layout
 constexpr int MARGIN_X = 12;
@@ -52,10 +52,10 @@ constexpr int FOOTER_BASELINE = 295;
 const text::Geometry BOOK_GEOMETRY{
     SCREEN_W - 2 * MARGIN_X,       // width
     FOOTER_RULE_Y - 4 - BODY_TOP,  // height
-    25,                            // lineHeight
-    21,                            // ascent (serif9 ascender)
-    6,                             // descent
-    18,                            // indent
+    28,                            // lineHeight
+    23,                            // ascent (merri11 ascender)
+    7,                             // descent
+    22,                            // indent
     3,                             // paraGap
     10,                            // headingGap
 };
