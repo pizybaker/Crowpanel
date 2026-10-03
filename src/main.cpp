@@ -106,6 +106,10 @@ int tocTop = 0;
 int tocCurrent = -1;  // chapter containing the page the contents were opened from
 
 Screen screen = Screen::Home;
+// The screen currently on the panel; shownValid is false after a one-off
+// message screen, so the next render is a full refresh.
+Screen shownScreen = Screen::Home;
+bool shownValid = false;
 transfer::Info wifi;
 
 // Decoded home image, kept so returning home doesn't re-decode the JPEG.
@@ -169,21 +173,42 @@ void fitText(const EpdFontData* f, char* out, size_t cap, const char* in, int ma
   }
 }
 
-// Every screen change is the same full GC refresh. The 0x17 A5 update powers
-// the panel's drivers down when it finishes but leaves the controller awake,
-// so the panel stays out of deep sleep between refreshes and the 210 ms
-// hardware reset only runs on the first refresh or after a BUSY timeout.
+// Updates within one screen (page turns, moving a list selection) use the
+// flash-free DU refresh; screen changes, and every FULL_REFRESH_EVERY-th
+// update, use the full GC refresh to clear DU's ghosting. The controller
+// stays out of deep sleep, so the 210 ms hardware reset and init only run on
+// the first refresh or after a BUSY timeout; its high-voltage supply stays on
+// until the screen has been idle for PANEL_IDLE_OFF_MS.
+constexpr int FULL_REFRESH_EVERY = 6;
+// DU drive length, picked with the waveform_test firmware: 12 frames (~340 ms)
+// looked best of 20/15/12/10/8. EPD's default is the vendor's 20.
+constexpr uint8_t DU_FRAMES = 12;
+constexpr uint32_t PANEL_IDLE_OFF_MS = 3000;
 bool panelNeedsReset = true;
+int fastSinceFull = FULL_REFRESH_EVERY;  // first refresh must be GC
+uint32_t lastRefreshMs = 0;
 
-void present() {
+void present(bool allowFast) {
   uint32_t t0 = millis();
   if (panelNeedsReset) {
     EPD_RESET();
+    EPD_Init();
     panelNeedsReset = false;
   }
-  EPD_Init();
-  if (!EPD_Display(imageBuf)) panelNeedsReset = true;
-  Serial.printf("[epd] refresh %lu ms\n", millis() - t0);
+  const bool fast = allowFast && fastSinceFull < FULL_REFRESH_EVERY;
+  if (fast ? EPD_DisplayFast(imageBuf, DU_FRAMES) : EPD_Display(imageBuf)) {
+    fastSinceFull = fast ? fastSinceFull + 1 : 0;
+  } else {
+    panelNeedsReset = true;
+    fastSinceFull = FULL_REFRESH_EVERY;
+  }
+  lastRefreshMs = millis();
+  Serial.printf("[epd] %s refresh %lu ms\n", fast ? "DU" : "GC", lastRefreshMs - t0);
+}
+
+// Called whenever no key is pending.
+void powerOffPanelIfIdle() {
+  if (millis() - lastRefreshMs >= PANEL_IDLE_OFF_MS) EPD_PowerOff();
 }
 
 // ---------------------------------------------------------------- progress
@@ -367,7 +392,8 @@ void renderMessage(const char* heading, const char* detail) {
   char line[112];
   fitText(BODY, line, sizeof(line), detail, SCREEN_W - 2 * MARGIN_X);
   drawCentered(BODY, 0, SCREEN_W, 172, line);
-  present();
+  present(false);
+  shownValid = false;
 }
 
 // Re-decodes only when the wallpaper file changed since the last decode.
@@ -419,12 +445,16 @@ void renderHome() {
 }
 
 void render() {
+  const uint32_t t0 = millis();
   if (screen == Screen::Home) renderHome();
   else if (screen == Screen::Library) renderLibrary();
   else if (screen == Screen::Toc) renderToc();
   else if (screen == Screen::Transfer) renderTransfer();
   else renderReader();
-  present();
+  Serial.printf("[render] %lu ms\n", millis() - t0);
+  present(shownValid && screen == shownScreen);
+  shownScreen = screen;
+  shownValid = true;
   readerNote[0] = '\0';
 }
 
@@ -671,11 +701,12 @@ void loop() {
   Button b;
   // While the Wi-Fi transfer screen is up, serve the phone between key checks.
   const bool serving = screen == Screen::Transfer;
-  if (!buttonsNext(b, serving ? pdMS_TO_TICKS(5) : portMAX_DELAY)) {
+  if (!buttonsNext(b, serving ? pdMS_TO_TICKS(5) : pdMS_TO_TICKS(PANEL_IDLE_OFF_MS))) {
     if (serving) {
       transfer::poll();
       if (transfer::takeSettledChange()) render();
     }
+    powerOffPanelIfIdle();
     return;
   }
   bool dirty = handle(b);
