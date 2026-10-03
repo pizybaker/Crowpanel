@@ -1,5 +1,21 @@
 #include "EPD_SPI.h"
 #include <SPI.h>
+#include <esp_cpu.h>
+
+namespace {
+
+// Minimum SCK half-period: register writes alone could clock far faster than
+// the controller accepts, so cap SCK near 5 MHz. Sized for the S3's top
+// 240 MHz clock; a slower CPU clock only lengthens it.
+constexpr uint32_t HALF_PERIOD_CYCLES = 240 * 100 / 1000;  // 100 ns
+
+inline void halfPeriod() {
+  const uint32_t start = esp_cpu_get_cycle_count();
+  while (esp_cpu_get_cycle_count() - start < HALF_PERIOD_CYCLES) {
+  }
+}
+
+}  // namespace
 
 void EPD_GPIOInit(void)
 {
@@ -9,6 +25,8 @@ void EPD_GPIOInit(void)
   pinMode(DC, OUTPUT);
   pinMode(CS, OUTPUT);
   pinMode(BUSY, INPUT);
+  digitalWrite(CS, HIGH);
+  digitalWrite(DC, HIGH);
 }
 
 /**
@@ -31,7 +49,9 @@ void EPD_WR_Bus(uint8_t dat)
     {
       EPD_MOSI_Clr();
     }
+    halfPeriod();
     EPD_SCK_Set();
+    halfPeriod();
     dat <<= 1;
   }
   EPD_CS_Set();
@@ -66,4 +86,11 @@ void EPD_WR_DATA8(uint8_t dat)
   EPD_WR_Bus(dat);
 //  SPI_Write(dat);
   EPD_DC_Set();
+}
+
+// DC stays HIGH after every command, so a data burst only clocks bytes.
+void EPD_WR_DATA(const uint8_t *buf, uint32_t len)
+{
+  EPD_DC_Set();
+  for (uint32_t i = 0; i < len; i++) EPD_WR_Bus(buf[i]);
 }

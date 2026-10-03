@@ -8,11 +8,13 @@
 
 // Legacy SSD1683 protocol used by the green-sticker V1.2A board, confirmed on
 // hardware (see docs/screen-bringup.md).
-void EPD_ReadBusy(void);
+// Returns false if BUSY never released (10 s timeout).
+bool EPD_ReadBusy(void);
 void EPD_RESET(void);
 void EPD_Init(void);
 // Full GC refresh: writes both RAM planes, loads the GC LUT, updates.
-void EPD_Display(const uint8_t *Image);
+// Returns false if the panel never finished.
+bool EPD_Display(const uint8_t *Image);
 void EPD_Sleep(void);
 
 #endif

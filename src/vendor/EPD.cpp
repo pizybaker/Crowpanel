@@ -17,13 +17,13 @@ constexpr uint8_t LUT_GC[5][42] = {
 void loadLutGc() {
   for (int r = 0; r < 5; r++) {
     EPD_WR_REG(0x20 + r);
-    for (int i = 0; i < 42; i++) EPD_WR_DATA8(LUT_GC[r][i]);
+    EPD_WR_DATA(LUT_GC[r], 42);
   }
 }
 
 void writePlane(uint8_t reg, const uint8_t *image) {
   EPD_WR_REG(reg);
-  for (uint32_t i = 0; i < (EPD_W / 8) * EPD_H; i++) EPD_WR_DATA8(image[i]);
+  EPD_WR_DATA(image, (EPD_W / 8) * EPD_H);
 }
 
 }  // namespace
@@ -31,16 +31,17 @@ void writePlane(uint8_t reg, const uint8_t *image) {
 // BUSY is active-LOW on this panel (measured: idle HIGH, LOW for ~1.2 s during
 // a GC refresh). Sleeping before it returns HIGH aborts the refresh.
 // Bounded so a stuck panel logs instead of hanging the firmware.
-void EPD_ReadBusy(void) {
+bool EPD_ReadBusy(void) {
   uint32_t start = millis();
   delay(1);
   while (EPD_ReadBUSY == LOW) {
     if (millis() - start > 10000) {
       Serial.println("[epd] BUSY timeout");
-      return;
+      return false;
     }
     delay(1);
   }
+  return true;
 }
 
 void EPD_RESET(void) {
@@ -93,7 +94,7 @@ void EPD_Init(void) {
 
 // Writing the "old" plane (0x10) as well as the "new" one (0x13) makes the GC
 // waveform clear against a known frame, so page turns don't accumulate ghosts.
-void EPD_Display(const uint8_t *Image) {
+bool EPD_Display(const uint8_t *Image) {
   EPD_WR_REG(0x50);
   EPD_WR_DATA8(0xD7);
   writePlane(0x10, Image);
@@ -101,7 +102,7 @@ void EPD_Display(const uint8_t *Image) {
   loadLutGc();
   EPD_WR_REG(0x17);  // update
   EPD_WR_DATA8(0xA5);
-  EPD_ReadBusy();
+  return EPD_ReadBusy();
 }
 
 void EPD_Sleep(void) {

@@ -169,14 +169,20 @@ void fitText(const EpdFontData* f, char* out, size_t cap, const char* in, int ma
   }
 }
 
-// Every screen change is the same full refresh: reset + init before each one,
-// exactly like the vendor examples (see docs/screen-bringup.md).
+// Every screen change is the same full GC refresh. The 0x17 A5 update powers
+// the panel's drivers down when it finishes but leaves the controller awake,
+// so the panel stays out of deep sleep between refreshes and the 210 ms
+// hardware reset only runs on the first refresh or after a BUSY timeout.
+bool panelNeedsReset = true;
+
 void present() {
   uint32_t t0 = millis();
-  EPD_RESET();
+  if (panelNeedsReset) {
+    EPD_RESET();
+    panelNeedsReset = false;
+  }
   EPD_Init();
-  EPD_Display(imageBuf);
-  EPD_Sleep();
+  if (!EPD_Display(imageBuf)) panelNeedsReset = true;
   Serial.printf("[epd] refresh %lu ms\n", millis() - t0);
 }
 
